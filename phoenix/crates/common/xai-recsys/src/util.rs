@@ -281,6 +281,7 @@ pub struct UserFeatures {
     pub installed_apps: Vec<bool>,
 }
 
+#[derive(Default)]
 pub struct InputBuffer {
     pub user_hashes: Vec<i32>,
     pub user_ip_hashes: Vec<i32>,
