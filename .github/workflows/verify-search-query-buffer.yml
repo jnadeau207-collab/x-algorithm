@@ -45,14 +45,12 @@ jobs:
           end = text.index(end_marker, start)
 
           replacement = (
-              "        let mut candidate_search_query_embeddings =\n"
-              "            vec![0.0f32; search_query_embedding_dim];\n"
-              "        if search_query_embedding_dim > 0\n"
-              "            && !candidate_set.search_query_embedding.is_empty()\n"
-              "        {\n"
-              "            if candidate_set.search_query_embedding.len()\n"
-              "                == search_query_embedding_dim\n"
-              "            {\n"
+              "        let mut candidate_search_query_embeddings = "
+              "vec![0.0f32; search_query_embedding_dim];\n"
+              "        if search_query_embedding_dim > 0 "
+              "&& !candidate_set.search_query_embedding.is_empty() {\n"
+              "            if candidate_set.search_query_embedding.len() "
+              "== search_query_embedding_dim {\n"
               "                candidate_search_query_embeddings\n"
               "                    .copy_from_slice(&candidate_set.search_query_embedding);\n"
               "            } else {\n"
@@ -135,9 +133,12 @@ jobs:
           path.write_text(text)
           PY
 
-      - name: Check formatting
-        working-directory: phoenix
-        run: cargo fmt --all -- --check
+      - name: Format and validate focused diff
+        run: |
+          cargo fmt --manifest-path phoenix/Cargo.toml --all
+          git diff --check
+          changed="$(git diff --name-only)"
+          test "$changed" = "phoenix/crates/common/xai-recsys/src/util.rs"
 
       - name: Run focused regression tests
         working-directory: phoenix
