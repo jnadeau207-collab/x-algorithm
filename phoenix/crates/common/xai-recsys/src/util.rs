@@ -448,18 +448,19 @@ impl InputBuffer {
             record_sid_coverage("candidate", present, candidates_to_process as u64);
         }
 
-        let mut candidate_search_query_embeddings = vec![0.0f32; search_query_embedding_dim];
-        if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
-            if candidate_set.search_query_embedding.len() == search_query_embedding_dim {
-                candidate_search_query_embeddings
-                    .copy_from_slice(&candidate_set.search_query_embedding);
-            } else {
+        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
+            && candidate_set.search_query_embedding.len() == search_query_embedding_dim
+        {
+            candidate_set.search_query_embedding.clone()
+        } else {
+            if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
                 log::error!(
-                    "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving zeros",
+                    "search_query_embedding dim {} != model {search_query_embedding_dim}; using zero vector",
                     candidate_set.search_query_embedding.len()
                 );
             }
-        }
+            vec![0.0f32; search_query_embedding_dim]
+        };
 
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
         let n_post_bool = model_config.hash_table.num_post_bool_features;
