@@ -448,19 +448,18 @@ impl InputBuffer {
             record_sid_coverage("candidate", present, candidates_to_process as u64);
         }
 
-        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
-            && candidate_set.search_query_embedding.len() == search_query_embedding_dim
-        {
-            candidate_set.search_query_embedding.clone()
-        } else {
-            if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+        let mut candidate_search_query_embeddings = vec![0.0f32; search_query_embedding_dim];
+        if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+            if candidate_set.search_query_embedding.len() == search_query_embedding_dim {
+                candidate_search_query_embeddings
+                    .copy_from_slice(&candidate_set.search_query_embedding);
+            } else {
                 log::error!(
-                    "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving empty",
+                    "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving zeros",
                     candidate_set.search_query_embedding.len()
                 );
             }
-            Vec::new()
-        };
+        }
 
         let n_post_cat = model_config.hash_table.num_post_categorical_features;
         let n_post_bool = model_config.hash_table.num_post_bool_features;
@@ -1776,6 +1775,63 @@ mod tests {
         let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
         assert_eq!(cand.search_query_embeddings, query);
         assert_eq!(cand.search_query_embeddings.len(), 4);
+    }
+
+    #[test]
+    fn missing_search_query_overwrites_reused_candidate_prefix_with_zeros() {
+        let mut model_config = test_model_config(1);
+        model_config.search_query_embedding_dim = 2;
+        let candidates = vec![
+            pb::TweetInfo {
+                tweet_id: 1000,
+                author_id: 2000,
+                ..Default::default()
+            },
+            pb::TweetInfo {
+                tweet_id: 1001,
+                author_id: 2001,
+                ..Default::default()
+            },
+        ];
+
+        let with_query = InputBuffer::new_with_candidates(
+            &model_config,
+            &pb::CandidateSet {
+                search_query_embedding: vec![1.0, 2.0],
+                candidates: candidates.clone(),
+                ..Default::default()
+            },
+            None,
+        );
+        let without_query = InputBuffer::new_with_candidates(
+            &model_config,
+            &pb::CandidateSet {
+                candidates,
+                ..Default::default()
+            },
+            None,
+        );
+
+        let mut reused_row = vec![9.0f32; 6];
+        repeat_query_into(&mut reused_row, &with_query.search_query_embeddings, 2);
+        assert_eq!(reused_row, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0]);
+
+        repeat_query_into(&mut reused_row, &without_query.search_query_embeddings, 2);
+        assert_eq!(reused_row, vec![0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn malformed_search_query_uses_one_zero_vector() {
+        let mut model_config = test_model_config(1);
+        model_config.search_query_embedding_dim = 4;
+        let candidate_set = pb::CandidateSet {
+            search_query_embedding: vec![1.0, 2.0],
+            ..Default::default()
+        };
+
+        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+
+        assert_eq!(cand.search_query_embeddings, vec![0.0; 4]);
     }
 
     #[test]
