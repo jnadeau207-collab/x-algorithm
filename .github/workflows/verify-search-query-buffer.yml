@@ -5,12 +5,8 @@ on:
     branches:
       - ci/verify-search-query-buffer
 
-permissions:
-  contents: write
-
 jobs:
   verify:
-    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -18,6 +14,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ci/verify-search-query-buffer
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -26,49 +23,31 @@ jobs:
       - name: Install native dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+          sudo apt-get install -y \
+            build-essential ca-certificates cmake curl pkg-config unzip \
+            libibverbs-dev libnl-3-dev libnl-route-3-dev libclang-dev libnuma-dev \
+            libssl-dev python3-dev protobuf-compiler
 
-      - name: Apply focused fix and regression coverage
+      - name: Verify formatting and focused final diff
         run: |
+          cargo fmt --manifest-path phoenix/Cargo.toml --all -- --check
+          git diff --check 7ba776848b12d8422eb0f291ee03ea5c17ab0188..HEAD
+          test "$(git diff --name-only 7ba776848b12d8422eb0f291ee03ea5c17ab0188..HEAD -- phoenix/crates/common/xai-recsys/src/util.rs)" = \
+            "phoenix/crates/common/xai-recsys/src/util.rs"
+
+      - name: Prove the regression fails on upstream main
+        run: |
+          git worktree add /tmp/upstream-main 7ba776848b12d8422eb0f291ee03ea5c17ab0188
           python3 - <<'PY'
           from pathlib import Path
 
-          path = Path("phoenix/crates/common/xai-recsys/src/util.rs")
+          path = Path("/tmp/upstream-main/phoenix/crates/common/xai-recsys/src/util.rs")
           text = path.read_text()
-
-          start_marker = (
-              "        let candidate_search_query_embeddings = if "
-              "search_query_embedding_dim > 0\n"
-          )
-          end_marker = "\n\n        let n_post_cat ="
-          start = text.index(start_marker)
-          end = text.index(end_marker, start)
-
-          replacement = (
-              "        let mut candidate_search_query_embeddings = "
-              "vec![0.0f32; search_query_embedding_dim];\n"
-              "        if search_query_embedding_dim > 0 "
-              "&& !candidate_set.search_query_embedding.is_empty() {\n"
-              "            if candidate_set.search_query_embedding.len() "
-              "== search_query_embedding_dim {\n"
-              "                candidate_search_query_embeddings\n"
-              "                    .copy_from_slice(&candidate_set.search_query_embedding);\n"
-              "            } else {\n"
-              "                log::error!(\n"
-              "                    \"search_query_embedding dim {} != model "
-              "{search_query_embedding_dim}; leaving zeros\",\n"
-              "                    candidate_set.search_query_embedding.len()\n"
-              "                );\n"
-              "            }\n"
-              "        }"
-          )
-          text = text[:start] + replacement + text[end:]
-
-          test_marker = (
+          marker = (
               "    #[test]\n"
               "    fn repeat_query_into_writes_prefix_and_keeps_tail() {\n"
           )
-          tests = (
+          regression = (
               "    #[test]\n"
               "    fn missing_search_query_overwrites_reused_candidate_prefix_with_zeros() {\n"
               "        let mut model_config = test_model_config(1);\n"
@@ -106,53 +85,37 @@ jobs:
               "\n"
               "        let mut reused_row = vec![9.0f32; 6];\n"
               "        repeat_query_into(&mut reused_row, &with_query.search_query_embeddings, 2);\n"
-              "        assert_eq!(reused_row, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0]);\n"
-              "\n"
               "        repeat_query_into(&mut reused_row, &without_query.search_query_embeddings, 2);\n"
+              "\n"
               "        assert_eq!(reused_row, vec![0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);\n"
               "    }\n"
               "\n"
-              "    #[test]\n"
-              "    fn malformed_search_query_uses_one_zero_vector() {\n"
-              "        let mut model_config = test_model_config(1);\n"
-              "        model_config.search_query_embedding_dim = 4;\n"
-              "        let candidate_set = pb::CandidateSet {\n"
-              "            search_query_embedding: vec![1.0, 2.0],\n"
-              "            ..Default::default()\n"
-              "        };\n"
-              "\n"
-              "        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);\n"
-              "\n"
-              "        assert_eq!(cand.search_query_embeddings, vec![0.0; 4]);\n"
-              "    }\n"
-              "\n"
           )
-          if test_marker not in text:
-              raise SystemExit("test insertion marker not found")
-          text = text.replace(test_marker, tests + test_marker, 1)
-          path.write_text(text)
+          if marker not in text:
+              raise SystemExit("baseline test insertion marker not found")
+          path.write_text(text.replace(marker, regression + marker, 1))
           PY
+          cargo fmt --manifest-path /tmp/upstream-main/phoenix/Cargo.toml --all
+          set +e
+          cargo test \
+            --manifest-path /tmp/upstream-main/phoenix/Cargo.toml \
+            -p xai-recsys \
+            missing_search_query_overwrites_reused_candidate_prefix_with_zeros \
+            > /tmp/baseline-test.log 2>&1
+          status=$?
+          set -e
+          cat /tmp/baseline-test.log
+          test "$status" -ne 0
+          grep -q "missing_search_query_overwrites_reused_candidate_prefix_with_zeros" \
+            /tmp/baseline-test.log
+          grep -q "FAILED" /tmp/baseline-test.log
 
-      - name: Format and validate focused diff
-        run: |
-          cargo fmt --manifest-path phoenix/Cargo.toml --all
-          git diff --check
-          changed="$(git diff --name-only)"
-          test "$changed" = "phoenix/crates/common/xai-recsys/src/util.rs"
-
-      - name: Run focused regression tests
+      - name: Run focused and full common-crate tests
         working-directory: phoenix
-        run: cargo test -p xai-recsys search_query
-
-      - name: Run xai-recsys test suite
-        working-directory: phoenix
-        run: cargo test -p xai-recsys
-
-      - name: Commit verified patch
         run: |
-          git restore phoenix/Cargo.lock || true
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add phoenix/crates/common/xai-recsys/src/util.rs
-          git commit -m "phoenix: zero missing search query embeddings"
-          git push origin HEAD:ci/verify-search-query-buffer
+          cargo test -p xai-recsys search_query
+          cargo test -p xai-recsys
+
+      - name: Run serving-engine library tests
+        working-directory: phoenix
+        run: cargo test -p xai-recsys-engine --lib
