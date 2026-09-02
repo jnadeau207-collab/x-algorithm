@@ -1,0 +1,100 @@
+name: Verify final Under the Hood post IDs branch
+
+on:
+  push:
+    branches:
+      - ci/verify-uth-post-ids
+
+jobs:
+  verify:
+    if: "${{ github.event.head_commit.message == 'ci: verify final Under the Hood post IDs branch' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out verification scripts
+        uses: actions/checkout@v4
+        with:
+          ref: ci/verify-uth-post-ids
+          path: verification
+
+      - name: Check out clean contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/uth-labeled-post-ids
+          fetch-depth: 0
+          path: source
+
+      - name: Run final verification suite
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source_lines = Path(
+              "verification/.github/workflows/verify-uth-post-ids-v2.yml"
+          ).read_text().splitlines()
+          wanted = [
+              "Install verification tools",
+              "Verify Thrift and Scala syntax",
+              "Run exact post-ID helper tests",
+              "Verify report and pipeline contract",
+          ]
+          scripts = {}
+          i = 0
+          while i < len(source_lines):
+              line = source_lines[i]
+              if line.startswith("      - name: "):
+                  name = line[len("      - name: ") :]
+                  j = i + 1
+                  while j < len(source_lines) and not source_lines[j].startswith("      - "):
+                      if source_lines[j] == "        run: |":
+                          j += 1
+                          block = []
+                          while j < len(source_lines) and not source_lines[j].startswith("      - "):
+                              current = source_lines[j]
+                              block.append(current[10:] if current.startswith("          ") else current)
+                              j += 1
+                          scripts[name] = "\n".join(block) + "\n"
+                          break
+                      j += 1
+              i += 1
+
+          missing = [name for name in wanted if name not in scripts]
+          if missing:
+              raise SystemExit(f"verification scripts missing: {missing}")
+
+          for name in wanted:
+              print(f"::group::{name}", flush=True)
+              subprocess.run(
+                  ["bash", "-c", "set -euo pipefail\n" + scripts[name]],
+                  cwd="source",
+                  check=True,
+              )
+              print("::endgroup::", flush=True)
+
+          final_diff = r'''
+          git diff --check 85ac72a1bba41f21615e3f0bca56da75970a6633..HEAD
+          test "$(git rev-list --count 85ac72a1bba41f21615e3f0bca56da75970a6633..HEAD)" = "1"
+          test "$(git rev-parse HEAD^)" = "85ac72a1bba41f21615e3f0bca56da75970a6633"
+          actual="$(git diff --name-only 85ac72a1bba41f21615e3f0bca56da75970a6633..HEAD | sort)"
+          expected="$(cat <<'EOF' | sort
+          under-the-hood/scalding/UthDailyPostsBackfillJob.scala
+          under-the-hood/scalding/UthDailyPostsJob.scala
+          under-the-hood/scalding/UthPostIds.scala
+          under-the-hood/scalding/UthUserMonthMhPublisherJob.scala
+          under-the-hood/strato/columns/underTheHoodReport.User.strato
+          under-the-hood/thrift/uth_serving.thrift
+          EOF
+          )"
+          test "$actual" = "$expected"
+          test -z "$(git status --porcelain)"
+          '''
+          print("::group::Verify exact final commit", flush=True)
+          subprocess.run(
+              ["bash", "-c", "set -euo pipefail\n" + final_diff],
+              cwd="source",
+              check=True,
+          )
+          print("::endgroup::", flush=True)
+          PY
