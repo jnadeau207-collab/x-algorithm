@@ -36,105 +36,102 @@ jobs:
           path = Path("phoenix/crates/common/xai-recsys/src/util.rs")
           text = path.read_text()
 
-          old = '''        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
-              && candidate_set.search_query_embedding.len() == search_query_embedding_dim
-          {
-              candidate_set.search_query_embedding.clone()
-          } else {
-              if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
-                  log::error!(
-                      "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving empty",
-                      candidate_set.search_query_embedding.len()
-                  );
-              }
-              Vec::new()
-          };
-          '''
+          start_marker = (
+              "        let candidate_search_query_embeddings = if "
+              "search_query_embedding_dim > 0\n"
+          )
+          end_marker = "\n\n        let n_post_cat ="
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
 
-          new = '''        let mut candidate_search_query_embeddings =
-              vec![0.0f32; search_query_embedding_dim];
-          if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
-              if candidate_set.search_query_embedding.len() == search_query_embedding_dim {
-                  candidate_search_query_embeddings
-                      .copy_from_slice(&candidate_set.search_query_embedding);
-              } else {
-                  log::error!(
-                      "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving zeros",
-                      candidate_set.search_query_embedding.len()
-                  );
-              }
-          }
-          '''
+          replacement = (
+              "        let mut candidate_search_query_embeddings =\n"
+              "            vec![0.0f32; search_query_embedding_dim];\n"
+              "        if search_query_embedding_dim > 0\n"
+              "            && !candidate_set.search_query_embedding.is_empty()\n"
+              "        {\n"
+              "            if candidate_set.search_query_embedding.len()\n"
+              "                == search_query_embedding_dim\n"
+              "            {\n"
+              "                candidate_search_query_embeddings\n"
+              "                    .copy_from_slice(&candidate_set.search_query_embedding);\n"
+              "            } else {\n"
+              "                log::error!(\n"
+              "                    \"search_query_embedding dim {} != model "
+              "{search_query_embedding_dim}; leaving zeros\",\n"
+              "                    candidate_set.search_query_embedding.len()\n"
+              "                );\n"
+              "            }\n"
+              "        }"
+          )
+          text = text[:start] + replacement + text[end:]
 
-          if old not in text:
-              raise SystemExit("target search-query construction block not found")
-          text = text.replace(old, new, 1)
-
-          marker = '''    #[test]
-          fn repeat_query_into_writes_prefix_and_keeps_tail() {
-          '''
-          tests = '''    #[test]
-          fn missing_search_query_overwrites_reused_candidate_prefix_with_zeros() {
-              let mut model_config = test_model_config(1);
-              model_config.search_query_embedding_dim = 2;
-              let candidates = vec![
-                  pb::TweetInfo {
-                      tweet_id: 1000,
-                      author_id: 2000,
-                      ..Default::default()
-                  },
-                  pb::TweetInfo {
-                      tweet_id: 1001,
-                      author_id: 2001,
-                      ..Default::default()
-                  },
-              ];
-
-              let with_query = InputBuffer::new_with_candidates(
-                  &model_config,
-                  &pb::CandidateSet {
-                      search_query_embedding: vec![1.0, 2.0],
-                      candidates: candidates.clone(),
-                      ..Default::default()
-                  },
-                  None,
-              );
-              let without_query = InputBuffer::new_with_candidates(
-                  &model_config,
-                  &pb::CandidateSet {
-                      candidates,
-                      ..Default::default()
-                  },
-                  None,
-              );
-
-              let mut reused_row = vec![9.0f32; 6];
-              repeat_query_into(&mut reused_row, &with_query.search_query_embeddings, 2);
-              assert_eq!(reused_row, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0]);
-
-              repeat_query_into(&mut reused_row, &without_query.search_query_embeddings, 2);
-              assert_eq!(reused_row, vec![0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);
-          }
-
-          #[test]
-          fn malformed_search_query_uses_one_zero_vector() {
-              let mut model_config = test_model_config(1);
-              model_config.search_query_embedding_dim = 4;
-              let candidate_set = pb::CandidateSet {
-                  search_query_embedding: vec![1.0, 2.0],
-                  ..Default::default()
-              };
-
-              let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
-
-              assert_eq!(cand.search_query_embeddings, vec![0.0; 4]);
-          }
-
-          '''
-
-          if marker not in text:
+          test_marker = (
+              "    #[test]\n"
+              "    fn repeat_query_into_writes_prefix_and_keeps_tail() {\n"
+          )
+          tests = (
+              "    #[test]\n"
+              "    fn missing_search_query_overwrites_reused_candidate_prefix_with_zeros() {\n"
+              "        let mut model_config = test_model_config(1);\n"
+              "        model_config.search_query_embedding_dim = 2;\n"
+              "        let candidates = vec![\n"
+              "            pb::TweetInfo {\n"
+              "                tweet_id: 1000,\n"
+              "                author_id: 2000,\n"
+              "                ..Default::default()\n"
+              "            },\n"
+              "            pb::TweetInfo {\n"
+              "                tweet_id: 1001,\n"
+              "                author_id: 2001,\n"
+              "                ..Default::default()\n"
+              "            },\n"
+              "        ];\n"
+              "\n"
+              "        let with_query = InputBuffer::new_with_candidates(\n"
+              "            &model_config,\n"
+              "            &pb::CandidateSet {\n"
+              "                search_query_embedding: vec![1.0, 2.0],\n"
+              "                candidates: candidates.clone(),\n"
+              "                ..Default::default()\n"
+              "            },\n"
+              "            None,\n"
+              "        );\n"
+              "        let without_query = InputBuffer::new_with_candidates(\n"
+              "            &model_config,\n"
+              "            &pb::CandidateSet {\n"
+              "                candidates,\n"
+              "                ..Default::default()\n"
+              "            },\n"
+              "            None,\n"
+              "        );\n"
+              "\n"
+              "        let mut reused_row = vec![9.0f32; 6];\n"
+              "        repeat_query_into(&mut reused_row, &with_query.search_query_embeddings, 2);\n"
+              "        assert_eq!(reused_row, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0]);\n"
+              "\n"
+              "        repeat_query_into(&mut reused_row, &without_query.search_query_embeddings, 2);\n"
+              "        assert_eq!(reused_row, vec![0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);\n"
+              "    }\n"
+              "\n"
+              "    #[test]\n"
+              "    fn malformed_search_query_uses_one_zero_vector() {\n"
+              "        let mut model_config = test_model_config(1);\n"
+              "        model_config.search_query_embedding_dim = 4;\n"
+              "        let candidate_set = pb::CandidateSet {\n"
+              "            search_query_embedding: vec![1.0, 2.0],\n"
+              "            ..Default::default()\n"
+              "        };\n"
+              "\n"
+              "        let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);\n"
+              "\n"
+              "        assert_eq!(cand.search_query_embeddings, vec![0.0; 4]);\n"
+              "    }\n"
+              "\n"
+          )
+          if test_marker not in text:
               raise SystemExit("test insertion marker not found")
-          text = text.replace(marker, tests + marker, 1)
+          text = text.replace(test_marker, tests + test_marker, 1)
           path.write_text(text)
           PY
 
