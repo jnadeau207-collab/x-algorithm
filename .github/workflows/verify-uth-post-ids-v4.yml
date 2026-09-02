@@ -1,0 +1,95 @@
+name: Verify Under the Hood post IDs v4
+
+on:
+  push:
+    branches:
+      - ci/verify-uth-post-ids
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: "${{ github.event.head_commit.message == 'ci: verify Under the Hood post IDs v4' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/verify-uth-post-ids
+          fetch-depth: 0
+
+      - name: Apply production patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          workflow = Path(
+              ".github/workflows/verify-uth-post-ids-v3.yml"
+          ).read_text()
+          heredoc_start = "          python3 - <<'PY'\n"
+          start = workflow.index(heredoc_start) + len(heredoc_start)
+          end = workflow.index("\n          PY", start)
+          exec(dedent(workflow[start:end]), {}, {})
+          PY
+
+      - name: Run verification suite
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          source = Path(".github/workflows/verify-uth-post-ids-v2.yml").read_text().splitlines()
+          wanted = [
+              "Install verification tools",
+              "Verify Thrift and Scala syntax",
+              "Run exact post-ID helper tests",
+              "Verify report and pipeline contract",
+              "Verify focused final diff",
+              "Commit verified implementation",
+          ]
+          scripts = {}
+          i = 0
+          while i < len(source):
+              line = source[i]
+              if line.startswith("      - name: "):
+                  name = line[len("      - name: ") :]
+                  j = i + 1
+                  while j < len(source) and not source[j].startswith("      - "):
+                      if source[j] == "        run: |":
+                          j += 1
+                          block = []
+                          while j < len(source) and not source[j].startswith("      - "):
+                              current = source[j]
+                              block.append(current[10:] if current.startswith("          ") else current)
+                              j += 1
+                          scripts[name] = "\n".join(block) + "\n"
+                          break
+                      j += 1
+              i += 1
+
+          missing = [name for name in wanted if name not in scripts]
+          if missing:
+              raise SystemExit(f"verification scripts missing: {missing}")
+
+          old_diff = 'actual="$(git diff --name-only | sort)"'
+          new_diff = (
+              'actual="$( { git diff --name-only; '
+              'git ls-files --others --exclude-standard; } | sort)"'
+          )
+          if scripts["Verify focused final diff"].count(old_diff) != 1:
+              raise SystemExit("focused-diff command marker changed")
+          scripts["Verify focused final diff"] = scripts[
+              "Verify focused final diff"
+          ].replace(old_diff, new_diff, 1)
+
+          for name in wanted:
+              print(f"::group::{name}", flush=True)
+              subprocess.run(
+                  ["bash", "-c", "set -euo pipefail\n" + scripts[name]],
+                  check=True,
+              )
+              print("::endgroup::", flush=True)
+          PY
