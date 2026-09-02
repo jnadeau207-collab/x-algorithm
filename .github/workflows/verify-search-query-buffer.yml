@@ -1,0 +1,160 @@
+name: Verify search-query buffer fix
+
+on:
+  push:
+    branches:
+      - ci/verify-search-query-buffer
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/verify-search-query-buffer
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Install native dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler pkg-config libssl-dev
+
+      - name: Apply focused fix and regression coverage
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("phoenix/crates/common/xai-recsys/src/util.rs")
+          text = path.read_text()
+
+          old = '''        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
+              && candidate_set.search_query_embedding.len() == search_query_embedding_dim
+          {
+              candidate_set.search_query_embedding.clone()
+          } else {
+              if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+                  log::error!(
+                      "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving empty",
+                      candidate_set.search_query_embedding.len()
+                  );
+              }
+              Vec::new()
+          };
+          '''
+
+          new = '''        let mut candidate_search_query_embeddings =
+              vec![0.0f32; search_query_embedding_dim];
+          if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+              if candidate_set.search_query_embedding.len() == search_query_embedding_dim {
+                  candidate_search_query_embeddings
+                      .copy_from_slice(&candidate_set.search_query_embedding);
+              } else {
+                  log::error!(
+                      "search_query_embedding dim {} != model {search_query_embedding_dim}; leaving zeros",
+                      candidate_set.search_query_embedding.len()
+                  );
+              }
+          }
+          '''
+
+          if old not in text:
+              raise SystemExit("target search-query construction block not found")
+          text = text.replace(old, new, 1)
+
+          marker = '''    #[test]
+          fn repeat_query_into_writes_prefix_and_keeps_tail() {
+          '''
+          tests = '''    #[test]
+          fn missing_search_query_overwrites_reused_candidate_prefix_with_zeros() {
+              let mut model_config = test_model_config(1);
+              model_config.search_query_embedding_dim = 2;
+              let candidates = vec![
+                  pb::TweetInfo {
+                      tweet_id: 1000,
+                      author_id: 2000,
+                      ..Default::default()
+                  },
+                  pb::TweetInfo {
+                      tweet_id: 1001,
+                      author_id: 2001,
+                      ..Default::default()
+                  },
+              ];
+
+              let with_query = InputBuffer::new_with_candidates(
+                  &model_config,
+                  &pb::CandidateSet {
+                      search_query_embedding: vec![1.0, 2.0],
+                      candidates: candidates.clone(),
+                      ..Default::default()
+                  },
+                  None,
+              );
+              let without_query = InputBuffer::new_with_candidates(
+                  &model_config,
+                  &pb::CandidateSet {
+                      candidates,
+                      ..Default::default()
+                  },
+                  None,
+              );
+
+              let mut reused_row = vec![9.0f32; 6];
+              repeat_query_into(&mut reused_row, &with_query.search_query_embeddings, 2);
+              assert_eq!(reused_row, vec![1.0, 2.0, 1.0, 2.0, 9.0, 9.0]);
+
+              repeat_query_into(&mut reused_row, &without_query.search_query_embeddings, 2);
+              assert_eq!(reused_row, vec![0.0, 0.0, 0.0, 0.0, 9.0, 9.0]);
+          }
+
+          #[test]
+          fn malformed_search_query_uses_one_zero_vector() {
+              let mut model_config = test_model_config(1);
+              model_config.search_query_embedding_dim = 4;
+              let candidate_set = pb::CandidateSet {
+                  search_query_embedding: vec![1.0, 2.0],
+                  ..Default::default()
+              };
+
+              let cand = InputBuffer::new_with_candidates(&model_config, &candidate_set, None);
+
+              assert_eq!(cand.search_query_embeddings, vec![0.0; 4]);
+          }
+
+          '''
+
+          if marker not in text:
+              raise SystemExit("test insertion marker not found")
+          text = text.replace(marker, tests + marker, 1)
+          path.write_text(text)
+          PY
+
+      - name: Check formatting
+        working-directory: phoenix
+        run: cargo fmt --all -- --check
+
+      - name: Run focused regression tests
+        working-directory: phoenix
+        run: cargo test -p xai-recsys search_query
+
+      - name: Run xai-recsys test suite
+        working-directory: phoenix
+        run: cargo test -p xai-recsys
+
+      - name: Commit verified patch
+        run: |
+          git restore phoenix/Cargo.lock || true
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add phoenix/crates/common/xai-recsys/src/util.rs
+          git commit -m "phoenix: zero missing search query embeddings"
+          git push origin HEAD:ci/verify-search-query-buffer
