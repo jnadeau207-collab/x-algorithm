@@ -1,0 +1,291 @@
+name: Verify Under the Hood post IDs v2
+
+on:
+  push:
+    branches:
+      - ci/verify-uth-post-ids
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: "${{ github.event.head_commit.message == 'ci: verify Under the Hood post IDs v2' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/verify-uth-post-ids
+          fetch-depth: 0
+
+      - name: Apply production patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          workflow_path = Path(".github/workflows/verify-uth-post-ids.yml")
+          workflow = workflow_path.read_text()
+          heredoc_start = "          python3 - <<'PY'\n"
+          start = workflow.index(heredoc_start) + len(heredoc_start)
+          end = workflow.index("\n          PY", start)
+          original_script = dedent(workflow[start:end])
+
+          publisher_marker = (
+              '\npublisher = "under-the-hood/scalding/'
+              'UthUserMonthMhPublisherJob.scala"\n'
+          )
+          report_marker = (
+              '\nreport = "under-the-hood/strato/columns/'
+              'underTheHoodReport.User.strato"\n'
+          )
+          if original_script.count(publisher_marker) != 1:
+              raise SystemExit("publisher section marker is not unique")
+          prefix, publisher_and_report = original_script.split(publisher_marker, 1)
+          if publisher_and_report.count(report_marker) != 1:
+              raise SystemExit("report section marker is not unique")
+          _, report_tail = publisher_and_report.split(report_marker, 1)
+
+          namespace = {}
+          exec(prefix, namespace, namespace)
+          replace_once = namespace["replace_once"]
+
+          publisher = "under-the-hood/scalding/UthUserMonthMhPublisherJob.scala"
+          replace_once(
+              publisher,
+              """          removed <- row.removed
+                    } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed))""",
+              """          removed <- row.removed
+                      postIds = row.postIds.getOrElse(Seq.empty)
+                    } yield (
+                      (userId, monthBucket(day)),
+                      (label, dayOfMonth(day), carried, removed, postIds)
+                    )""",
+          )
+          replace_once(
+              publisher,
+              ".groupBy { case (label, _, _, _) => label }",
+              ".groupBy { case (label, _, _, _, _) => label }",
+          )
+
+          publisher_path = Path(publisher)
+          publisher_text = publisher_path.read_text()
+          aggregate_anchor = "          val postLabelAgg = labelsOpt"
+          block_start_marker = "              val days = rows"
+          block_end_marker = "              UthPostLabelAggregate(Some(label), Some(days))"
+          aggregate_start = publisher_text.index(aggregate_anchor)
+          block_start = publisher_text.index(block_start_marker, aggregate_start)
+          block_end = publisher_text.index(block_end_marker, block_start) + len(block_end_marker)
+          replacement = """              val selectedRows = rows
+                .groupBy { case (_, day, _, _, _) => day }
+                .values
+                .map { dayRows =>
+                  dayRows.maxBy {
+                    case (_, _, carried, removed, postIds) =>
+                      (carried, removed, postIds.size)
+                  }
+                }
+                .toList
+              val days = selectedRows
+                .map {
+                  case (_, day, carried, removed, _) =>
+                    UthDayCarriedRemoved(Some(day), Some(carried), Some(removed))
+                }
+                .sortBy(_.dayOfMonth.getOrElse(0))
+              val postIds = UthPostIds.newestDistinct(
+                selectedRows.flatMap(_._5),
+                UthPostIds.MaxPostIdsPerLabel
+              )
+              UthPostLabelAggregate(
+                label = Some(label),
+                days = Some(days),
+                postIds = Some(postIds)
+              )"""
+          publisher_path.write_text(
+              publisher_text[:block_start] + replacement + publisher_text[block_end:]
+          )
+
+          report_code = (
+              'report = "under-the-hood/strato/columns/'
+              'underTheHoodReport.User.strato"\n' + report_tail
+          )
+          exec(report_code, namespace, namespace)
+          PY
+
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y thrift-compiler curl
+          curl -fsSL --retry 3 \
+            https://downloads.lightbend.com/scala/2.12.20/scala-2.12.20.tgz \
+            -o /tmp/scala.tgz
+          tar -xzf /tmp/scala.tgz -C /tmp
+
+      - name: Verify Thrift and Scala syntax
+        run: |
+          mkdir -p /tmp/uth-thrift /tmp/scala-parser
+          thrift --gen java -out /tmp/uth-thrift under-the-hood/thrift/uth_serving.thrift
+          /tmp/scala-2.12.20/bin/scalac \
+            -Ystop-after:parser \
+            -d /tmp/scala-parser \
+            under-the-hood/scalding/UthPostIds.scala \
+            under-the-hood/scalding/UthDailyPostsJob.scala \
+            under-the-hood/scalding/UthDailyPostsBackfillJob.scala \
+            under-the-hood/scalding/UthUserMonthMhPublisherJob.scala
+
+      - name: Run exact post-ID helper tests
+        run: |
+          cat > /tmp/UthPostIdsVerification.scala <<'SCALA'
+          import com.twitter.visibility.under_the_hood.UthPostIds
+
+          object UthPostIdsVerification extends App {
+            val summary = UthPostIds.summarize(
+              Seq(
+                (30L, 0L),
+                (10L, 0L),
+                (30L, 1L),
+                (20L, 1L),
+                (20L, 0L)
+              )
+            )
+            assert(summary.carried == 3L, summary)
+            assert(summary.removed == 2L, summary)
+            assert(summary.postIds == Seq(10L, 20L, 30L), summary)
+
+            val empty = UthPostIds.summarize(Seq.empty)
+            assert(empty.carried == 0L, empty)
+            assert(empty.removed == 0L, empty)
+            assert(empty.postIds.isEmpty, empty)
+
+            val bounded = UthPostIds.newestDistinct((1L to 1005L) ++ Seq(1005L), 1000)
+            assert(bounded.size == 1000, bounded.size)
+            assert(bounded.head == 6L, bounded.head)
+            assert(bounded.last == 1005L, bounded.last)
+            assert(bounded == bounded.sorted, "IDs must be deterministic and ascending")
+
+            val invalidLimitRejected =
+              try {
+                UthPostIds.newestDistinct(Seq(1L), 0)
+                false
+              } catch {
+                case _: IllegalArgumentException => true
+              }
+            assert(invalidLimitRejected, "zero limit must be rejected")
+
+            println("UthPostIds verification passed")
+          }
+          SCALA
+
+          mkdir -p /tmp/uth-post-id-classes
+          /tmp/scala-2.12.20/bin/scalac \
+            -d /tmp/uth-post-id-classes \
+            under-the-hood/scalding/UthPostIds.scala \
+            /tmp/UthPostIdsVerification.scala
+          /tmp/scala-2.12.20/bin/scala \
+            -cp /tmp/uth-post-id-classes \
+            UthPostIdsVerification
+
+      - name: Verify report and pipeline contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          thrift = Path("under-the-hood/thrift/uth_serving.thrift").read_text()
+          daily = Path("under-the-hood/scalding/UthDailyPostsJob.scala").read_text()
+          backfill = Path("under-the-hood/scalding/UthDailyPostsBackfillJob.scala").read_text()
+          helper = Path("under-the-hood/scalding/UthPostIds.scala").read_text()
+          publisher = Path("under-the-hood/scalding/UthUserMonthMhPublisherJob.scala").read_text()
+          report = Path(
+              "under-the-hood/strato/columns/underTheHoodReport.User.strato"
+          ).read_text()
+          wrapper = Path(
+              "under-the-hood/strato/columns/underTheHoodReport.strato"
+          ).read_text()
+
+          assert "4: optional list<i64> postIds (personalDataType = 'TweetId')" in thrift
+          assert "11: optional list<i64> postIds (personalDataType = 'TweetId')" in thrift
+          assert "3: optional list<i64> postIds" not in thrift
+          assert "10: optional list<i64> postIds" not in thrift
+
+          assert daily.count("postIds = Some(postIds)") == 2
+          assert backfill.count("postIds = Some(postIds)") == 2
+          assert "summary.carried, summary.removed, summary.postIds" in daily
+          assert "summary.removed," in backfill
+          assert "summary.postIds" in backfill
+
+          assert "val MaxPostIdsPerLabel: Int = 1000" in helper
+          assert "removed = byPostId.values.count" in helper
+          assert "postIds.toSet.toSeq.sorted.takeRight(limit)" in helper
+
+          assert "postIds = row.postIds.getOrElse(Seq.empty)" in publisher
+          assert "UthPostIds.newestDistinct(" in publisher
+          assert "UthPostIds.MaxPostIdsPerLabel" in publisher
+          assert "postIds = Some(postIds)" in publisher
+          assert "(carried, removed, postIds.size)" in publisher
+
+          assert "postIds = postIds.map(_.toString)" in report
+          assert "postIdsComplete = postIds.size.toLong == posts" in report
+          assert "CallContext.authenticatedTwitterUserId()" in wrapper
+          assert "accessPolicy = AllowTwitterUserId" in wrapper
+
+          def summarize(rows):
+              by_id = {}
+              for post_id, removed in rows:
+                  by_id[post_id] = by_id.get(post_id, False) or removed > 0
+              ids = sorted(by_id)
+              return len(ids), sum(by_id.values()), ids
+
+          carried, removed, ids = summarize(
+              [(300, 0), (100, 0), (300, 1), (200, 1)]
+          )
+          assert (carried, removed, ids) == (3, 2, [100, 200, 300])
+
+          full_month = sorted(set([10, 20] + [30, 40]))
+          assert len(full_month) == 4
+
+          partial_month = sorted(set([10, 20]))
+          existing_carried = 4
+          assert len(partial_month) != existing_carried
+          assert [str(v) for v in partial_month] == ["10", "20"]
+
+          for opening, closing in (("{", "}"), ("(", ")"), ("[", "]")):
+              assert report.count(opening) == report.count(closing), (
+                  opening,
+                  report.count(opening),
+                  closing,
+                  report.count(closing),
+              )
+
+          print("Under the Hood post-ID contract verification passed")
+          PY
+
+      - name: Verify focused final diff
+        run: |
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(cat <<'EOF' | sort
+          under-the-hood/scalding/UthDailyPostsBackfillJob.scala
+          under-the-hood/scalding/UthDailyPostsJob.scala
+          under-the-hood/scalding/UthPostIds.scala
+          under-the-hood/scalding/UthUserMonthMhPublisherJob.scala
+          under-the-hood/strato/columns/underTheHoodReport.User.strato
+          under-the-hood/thrift/uth_serving.thrift
+          EOF
+          )"
+          test "$actual" = "$expected"
+
+      - name: Commit verified implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            under-the-hood/scalding/UthDailyPostsBackfillJob.scala \
+            under-the-hood/scalding/UthDailyPostsJob.scala \
+            under-the-hood/scalding/UthPostIds.scala \
+            under-the-hood/scalding/UthUserMonthMhPublisherJob.scala \
+            under-the-hood/strato/columns/underTheHoodReport.User.strato \
+            under-the-hood/thrift/uth_serving.thrift
+          git commit -m "under-the-hood: include labeled post ids in reports"
+          git push origin HEAD:ci/verify-uth-post-ids
