@@ -1,0 +1,676 @@
+name: Verify Under the Hood post IDs
+
+on:
+  push:
+    branches:
+      - ci/verify-uth-post-ids
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    if: "${{ github.event.head_commit.message == 'ci: verify Under the Hood post IDs' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/verify-uth-post-ids
+          fetch-depth: 0
+
+      - name: Apply production patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path_str: str, old: str, new: str) -> None:
+              path = Path(path_str)
+              text = path.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(
+                      f"{path}: expected exactly one replacement marker, found {count}"
+                  )
+              path.write_text(text.replace(old, new, 1))
+
+          thrift = "under-the-hood/thrift/uth_serving.thrift"
+          replace_once(
+              thrift,
+              """struct UthPostLabelAggregate {
+            1: optional string label (personalDataType = 'TweetSafetyLabels')
+            2: optional list<UthDayCarriedRemoved> days
+          }(persisted = 'true', hasPersonalData = 'true')""",
+              """struct UthPostLabelAggregate {
+            1: optional string label (personalDataType = 'TweetSafetyLabels')
+            2: optional list<UthDayCarriedRemoved> days
+            // Newest logical post IDs represented by days, bounded by the month publisher.
+            4: optional list<i64> postIds (personalDataType = 'TweetId')
+          }(persisted = 'true', hasPersonalData = 'true')""",
+          )
+          replace_once(
+              thrift,
+              """struct UthDailyPostLabel {
+            1: optional i64 userId (personalDataType = 'UserId')
+            2: optional i32 authoredYyyymmdd
+            3: optional string label (personalDataType = 'TweetSafetyLabels')
+            4: optional i64 carried
+            5: optional i64 removed
+            6: optional i32 asOfYyyymmdd
+            7: optional i32 observationAgeDays
+            8: optional bool isFinal
+            9: optional i32 postObservationDays
+          }(persisted = 'true', hasPersonalData = 'true')""",
+              """struct UthDailyPostLabel {
+            1: optional i64 userId (personalDataType = 'UserId')
+            2: optional i32 authoredYyyymmdd
+            3: optional string label (personalDataType = 'TweetSafetyLabels')
+            4: optional i64 carried
+            5: optional i64 removed
+            6: optional i32 asOfYyyymmdd
+            7: optional i32 observationAgeDays
+            8: optional bool isFinal
+            9: optional i32 postObservationDays
+            // Logical post IDs represented by carried; absent on pre-migration rows.
+            11: optional list<i64> postIds (personalDataType = 'TweetId')
+          }(persisted = 'true', hasPersonalData = 'true')""",
+          )
+
+          helper = Path("under-the-hood/scalding/UthPostIds.scala")
+          if helper.exists():
+              raise SystemExit(f"{helper}: file already exists")
+          helper.write_text(
+              """package com.twitter.visibility.under_the_hood
+
+          object UthPostIds {
+            val MaxPostIdsPerLabel: Int = 1000
+
+            final case class Summary(carried: Long, removed: Long, postIds: Seq[Long])
+
+            def summarize(rows: Iterable[(Long, Long)]): Summary = {
+              val byPostId = rows.groupBy(_._1)
+              val postIds = byPostId.keys.toSeq.sorted
+              Summary(
+                carried = postIds.size.toLong,
+                removed = byPostId.values.count(_.exists(_._2 > 0L)).toLong,
+                postIds = postIds
+              )
+            }
+
+            def newestDistinct(postIds: Iterable[Long], limit: Int): Seq[Long] = {
+              require(limit > 0, s"limit must be > 0; got $limit")
+              postIds.toSet.toSeq.sorted.takeRight(limit)
+            }
+          }
+          """
+          )
+
+          daily = "under-the-hood/scalding/UthDailyPostsJob.scala"
+          replace_once(
+              daily,
+              """          case (userId, authoredDay, label, carried, removed) =>
+                      val age = calendarDaysBetween(authoredDay, asOfDay)
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(removed),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(age),
+                        isFinal = Some(age >= config.postObservationDays),
+                        postObservationDays = Some(config.postObservationDays)
+                      )""",
+              """          case (userId, authoredDay, label, carried, removed, postIds) =>
+                      val age = calendarDaysBetween(authoredDay, asOfDay)
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(removed),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(age),
+                        isFinal = Some(age >= config.postObservationDays),
+                        postObservationDays = Some(config.postObservationDays),
+                        postIds = Some(postIds)
+                      )""",
+          )
+          replace_once(
+              daily,
+              """          case (userId, authoredDay, label, carried) =>
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(0L),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(0),
+                        isFinal = Some(true),
+                        postObservationDays = Some(config.postObservationDays)
+                      )""",
+              """          case (userId, authoredDay, label, carried, postIds) =>
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(0L),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(0),
+                        isFinal = Some(true),
+                        postObservationDays = Some(config.postObservationDays),
+                        postIds = Some(postIds)
+                      )""",
+          )
+          replace_once(
+              daily,
+              """  private[under_the_hood] def countTweetFlagsOnBatchDay(
+              tweets: TypedPipe[UnhydratedFlatTweet],
+              testUserIds: Set[Long],
+              flagLabels: Set[String],
+              dayStartMs: Long,
+              dayEndMs: Long,
+              reducers: Int
+            ): TypedPipe[(Long, Int, String, Long)] =
+              if (flagLabels.isEmpty) TypedPipe.empty
+              else {
+                val flagged = tweets.flatMap { t =>
+                  if (inScope(testUserIds, t.userId) && t.shareSourceTweetId.isEmpty && !t.nullcast) {
+                    val logicalId = t.initialTweetId.getOrElse(t.tweetId)
+                    val createdMs = snowflakeCreatedMs(logicalId)
+                    if (createdMs >= dayStartMs && createdMs < dayEndMs) {
+                      tweetFlags(t).collect {
+                        case (label, true) if flagLabels.contains(label) =>
+                          ((t.userId, yyyymmdd(createdMs), logicalId, label), 1)
+                      }
+                    } else Nil
+                  } else Nil
+                }
+                val counts = applyReducers(flagged.group, reducers).sum.keys.map {
+                  case (userId, day, _, label) => ((userId, day, label), 1L)
+                }.sumByKey
+                (if (reducers > 0) counts.withReducers(reducers) else counts).toTypedPipe
+                  .map { case ((userId, day, label), carried) => (userId, day, label, carried) }
+              }""",
+              """  private[under_the_hood] def countTweetFlagsOnBatchDay(
+              tweets: TypedPipe[UnhydratedFlatTweet],
+              testUserIds: Set[Long],
+              flagLabels: Set[String],
+              dayStartMs: Long,
+              dayEndMs: Long,
+              reducers: Int
+            ): TypedPipe[(Long, Int, String, Long, Seq[Long])] =
+              if (flagLabels.isEmpty) TypedPipe.empty
+              else {
+                val flagged = tweets.flatMap { t =>
+                  if (inScope(testUserIds, t.userId) && t.shareSourceTweetId.isEmpty && !t.nullcast) {
+                    val logicalId = t.initialTweetId.getOrElse(t.tweetId)
+                    val createdMs = snowflakeCreatedMs(logicalId)
+                    if (createdMs >= dayStartMs && createdMs < dayEndMs) {
+                      tweetFlags(t).collect {
+                        case (label, true) if flagLabels.contains(label) =>
+                          ((t.userId, yyyymmdd(createdMs), logicalId, label), 1)
+                      }
+                    } else Nil
+                  } else Nil
+                }
+                val distinctPosts = applyReducers(flagged.group, reducers).sum.keys
+                applyReducers(
+                  distinctPosts.map {
+                    case (userId, day, logicalId, label) =>
+                      ((userId, day, label), (logicalId, 0L))
+                  }.group,
+                  reducers
+                ).toList.map {
+                  case ((userId, day, label), rows) =>
+                    val summary = UthPostIds.summarize(rows)
+                    (userId, day, label, summary.carried, summary.postIds)
+                }
+              }""",
+          )
+          replace_once(
+              daily,
+              """): TypedPipe[(Long, Int, String, Long, Long)] = {
+              val postByTweetId = posts.map {""",
+              """): TypedPipe[(Long, Int, String, Long, Long, Seq[Long])] = {
+              val postByTweetId = posts.map {""",
+          )
+          replace_once(
+              daily,
+              """    applyReducers(
+                reduced.collect {
+                  case ((_, userId, day, label, createdMs), (everApply, _, lastApply, lastExpires))
+                      if everApply =>
+                    val deadline = math.min(createdMs + observationMs, dayEndMs)
+                    val removed =
+                      if (removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L else 0L
+                    ((userId, day, label), (1L, removed))
+                }.group,
+                config.reducers
+              ).sum.toTypedPipe.map {
+                case ((userId, day, label), (carried, removed)) =>
+                  (userId, day, label, carried, removed)
+              }""",
+              """    applyReducers(
+                reduced.collect {
+                  case (
+                        (logicalId, userId, day, label, createdMs),
+                        (everApply, _, lastApply, lastExpires)
+                      ) if everApply =>
+                    val deadline = math.min(createdMs + observationMs, dayEndMs)
+                    val removed =
+                      if (removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L else 0L
+                    ((userId, day, label), (logicalId, removed))
+                }.group,
+                config.reducers
+              ).toList.map {
+                case ((userId, day, label), rows) =>
+                  val summary = UthPostIds.summarize(rows)
+                  (userId, day, label, summary.carried, summary.removed, summary.postIds)
+              }""",
+          )
+
+          backfill = "under-the-hood/scalding/UthDailyPostsBackfillJob.scala"
+          replace_once(
+              backfill,
+              """          case (userId, authoredDay, label, asOfDay, carried, removed) =>
+                      val age = calendarDaysBetween(authoredDay, asOfDay)
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(removed),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(age),
+                        isFinal = Some(age >= config.postObservationDays),
+                        postObservationDays = Some(config.postObservationDays)
+                      )""",
+              """          case (userId, authoredDay, label, asOfDay, carried, removed, postIds) =>
+                      val age = calendarDaysBetween(authoredDay, asOfDay)
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(removed),
+                        asOfYyyymmdd = Some(asOfDay),
+                        observationAgeDays = Some(age),
+                        isFinal = Some(age >= config.postObservationDays),
+                        postObservationDays = Some(config.postObservationDays),
+                        postIds = Some(postIds)
+                      )""",
+          )
+          replace_once(
+              backfill,
+              """          case (userId, authoredDay, label, carried) =>
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(0L),
+                        asOfYyyymmdd = Some(authoredDay),
+                        observationAgeDays = Some(0),
+                        isFinal = Some(true),
+                        postObservationDays = Some(config.postObservationDays)
+                      )""",
+              """          case (userId, authoredDay, label, carried, postIds) =>
+                      UthDailyPostLabel(
+                        userId = Some(userId),
+                        authoredYyyymmdd = Some(authoredDay),
+                        label = Some(label),
+                        carried = Some(carried),
+                        removed = Some(0L),
+                        asOfYyyymmdd = Some(authoredDay),
+                        observationAgeDays = Some(0),
+                        isFinal = Some(true),
+                        postObservationDays = Some(config.postObservationDays),
+                        postIds = Some(postIds)
+                      )""",
+          )
+          replace_once(
+              backfill,
+              """): TypedPipe[(Long, Int, String, Int, Long, Long)] = {
+              val postByTweetId = applyReducers(""",
+              """): TypedPipe[(Long, Int, String, Int, Long, Long, Seq[Long])] = {
+              val postByTweetId = applyReducers(""",
+          )
+          replace_once(
+              backfill,
+              """    applyReducers(
+                reduced.collect {
+                  case ((_, userId, day, label, asOfDay, createdMs), (everApply, _, lastApply, lastExpires))
+                      if everApply =>
+                    val deadline = math.min(createdMs + observationMs, yyyymmddToMs(asOfDay) + DayMs)
+                    val removed =
+                      if (UthDailyPostsApp
+                          .removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L
+                      else 0L
+                    ((userId, day, label, asOfDay), (1L, removed))
+                }.group,
+                config.reducers
+              ).sum.toTypedPipe.map {
+                case ((userId, day, label, asOfDay), (carried, removed)) =>
+                  (userId, day, label, asOfDay, carried, removed)
+              }""",
+              """    applyReducers(
+                reduced.collect {
+                  case (
+                        (logicalId, userId, day, label, asOfDay, createdMs),
+                        (everApply, _, lastApply, lastExpires)
+                      ) if everApply =>
+                    val deadline = math.min(createdMs + observationMs, yyyymmddToMs(asOfDay) + DayMs)
+                    val removed =
+                      if (UthDailyPostsApp
+                          .removedAfterLastAction(lastApply, lastExpires, createdMs, deadline)) 1L
+                      else 0L
+                    ((userId, day, label, asOfDay), (logicalId, removed))
+                }.group,
+                config.reducers
+              ).toList.map {
+                case ((userId, day, label, asOfDay), rows) =>
+                  val summary = UthPostIds.summarize(rows)
+                  (
+                    userId,
+                    day,
+                    label,
+                    asOfDay,
+                    summary.carried,
+                    summary.removed,
+                    summary.postIds
+                  )
+              }""",
+          )
+
+          publisher = "under-the-hood/scalding/UthUserMonthMhPublisherJob.scala"
+          replace_once(
+              publisher,
+              """    val labelsByUserMonth = groupToList(
+                latestPostLabels.flatMap { row =>
+                  for {
+                    userId <- row.userId if inScope(testUserIds, userId)
+                    day <- row.authoredYyyymmdd if inWindow(day)
+                    label <- row.label
+                    carried <- row.carried
+                    removed <- row.removed
+                  } yield ((userId, monthBucket(day)), (label, dayOfMonth(day), carried, removed))
+                },
+                reducers
+              )""",
+              """    val labelsByUserMonth = groupToList(
+                latestPostLabels.flatMap { row =>
+                  for {
+                    userId <- row.userId if inScope(testUserIds, userId)
+                    day <- row.authoredYyyymmdd if inWindow(day)
+                    label <- row.label
+                    carried <- row.carried
+                    removed <- row.removed
+                    postIds = row.postIds.getOrElse(Seq.empty)
+                  } yield (
+                    (userId, monthBucket(day)),
+                    (label, dayOfMonth(day), carried, removed, postIds)
+                  )
+                },
+                reducers
+              )""",
+          )
+          replace_once(
+              publisher,
+              """          val postLabelAgg = labelsOpt
+                    .getOrElse(Nil)
+                    .groupBy { case (label, _, _, _) => label }
+                    .map {
+                      case (label, rows) =>
+                        val days = rows
+                          .groupBy { case (_, day, _, _) => day }
+                          .map {
+                            case (day, dayRows) =>
+                              val best = dayRows.maxBy {
+                                case (_, _, carried, removed) => (carried, removed)
+                              }
+                              UthDayCarriedRemoved(Some(day), Some(best._3), Some(best._4))
+                          }
+                          .toList
+                          .sortBy(_.dayOfMonth.getOrElse(0))
+                        UthPostLabelAggregate(Some(label), Some(days))
+                    }
+                    .toList
+                    .sortBy(_.label.getOrElse(""))""",
+              """          val postLabelAgg = labelsOpt
+                    .getOrElse(Nil)
+                    .groupBy { case (label, _, _, _, _) => label }
+                    .map {
+                      case (label, rows) =>
+                        val selectedRows = rows
+                          .groupBy { case (_, day, _, _, _) => day }
+                          .values
+                          .map { dayRows =>
+                            dayRows.maxBy {
+                              case (_, _, carried, removed, _) => (carried, removed)
+                            }
+                          }
+                          .toList
+                        val days = selectedRows
+                          .map {
+                            case (_, day, carried, removed, _) =>
+                              UthDayCarriedRemoved(Some(day), Some(carried), Some(removed))
+                          }
+                          .sortBy(_.dayOfMonth.getOrElse(0))
+                        val postIds = UthPostIds.newestDistinct(
+                          selectedRows.flatMap(_._5),
+                          UthPostIds.MaxPostIdsPerLabel
+                        )
+                        UthPostLabelAggregate(
+                          label = Some(label),
+                          days = Some(days),
+                          postIds = Some(postIds)
+                        )
+                    }
+                    .toList
+                    .sortBy(_.label.getOrElse(""))""",
+          )
+
+          report = "under-the-hood/strato/columns/underTheHoodReport.User.strato"
+          replace_once(
+              report,
+              """      agg.label.filter(underTheHoodLabels.isPostLabel).map { raw =>
+                  val posts = sumCarried(agg.days)
+                  {
+                    label = underTheHoodLabels.postLabelName(raw),
+                    about = underTheHoodLabels.postLabelAbout(raw),
+                    effect = underTheHoodLabels.postLabelEffect(raw),
+                    posts = posts,
+                    totalPostsInMonth = postCount,
+                    percentageOfPosts = formatPercentage(posts, postCount),
+                  }
+                }""",
+              """      agg.label.filter(underTheHoodLabels.isPostLabel).map { raw =>
+                  val posts = sumCarried(agg.days)
+                  val postIds = agg.postIds.getOrElse(Seq.empty).distinct.sorted
+                  {
+                    label = underTheHoodLabels.postLabelName(raw),
+                    about = underTheHoodLabels.postLabelAbout(raw),
+                    effect = underTheHoodLabels.postLabelEffect(raw),
+                    posts = posts,
+                    postIds = postIds.map(_.toString),
+                    postIdsComplete = postIds.size.toLong == posts,
+                    totalPostsInMonth = postCount,
+                    percentageOfPosts = formatPercentage(posts, postCount),
+                  }
+                }""",
+          )
+          PY
+
+      - name: Install verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y thrift-compiler curl
+          curl -fsSL --retry 3 \
+            https://downloads.lightbend.com/scala/2.12.20/scala-2.12.20.tgz \
+            -o /tmp/scala.tgz
+          tar -xzf /tmp/scala.tgz -C /tmp
+
+      - name: Verify Thrift and Scala syntax
+        run: |
+          mkdir -p /tmp/uth-thrift /tmp/scala-parser
+          thrift --gen java -out /tmp/uth-thrift under-the-hood/thrift/uth_serving.thrift
+          /tmp/scala-2.12.20/bin/scalac \
+            -Ystop-after:parser \
+            -d /tmp/scala-parser \
+            under-the-hood/scalding/UthPostIds.scala \
+            under-the-hood/scalding/UthDailyPostsJob.scala \
+            under-the-hood/scalding/UthDailyPostsBackfillJob.scala \
+            under-the-hood/scalding/UthUserMonthMhPublisherJob.scala
+
+      - name: Run exact post-ID helper tests
+        run: |
+          cat > /tmp/UthPostIdsVerification.scala <<'SCALA'
+          import com.twitter.visibility.under_the_hood.UthPostIds
+
+          object UthPostIdsVerification extends App {
+            val summary = UthPostIds.summarize(
+              Seq(
+                (30L, 0L),
+                (10L, 0L),
+                (30L, 1L),
+                (20L, 1L),
+                (20L, 0L)
+              )
+            )
+            assert(summary.carried == 3L, summary)
+            assert(summary.removed == 2L, summary)
+            assert(summary.postIds == Seq(10L, 20L, 30L), summary)
+
+            val empty = UthPostIds.summarize(Seq.empty)
+            assert(empty.carried == 0L, empty)
+            assert(empty.removed == 0L, empty)
+            assert(empty.postIds.isEmpty, empty)
+
+            val bounded = UthPostIds.newestDistinct((1L to 1005L) ++ Seq(1005L), 1000)
+            assert(bounded.size == 1000, bounded.size)
+            assert(bounded.head == 6L, bounded.head)
+            assert(bounded.last == 1005L, bounded.last)
+            assert(bounded == bounded.sorted, "IDs must be deterministic and ascending")
+
+            val invalidLimitRejected =
+              try {
+                UthPostIds.newestDistinct(Seq(1L), 0)
+                false
+              } catch {
+                case _: IllegalArgumentException => true
+              }
+            assert(invalidLimitRejected, "zero limit must be rejected")
+
+            println("UthPostIds verification passed")
+          }
+          SCALA
+
+          mkdir -p /tmp/uth-post-id-classes
+          /tmp/scala-2.12.20/bin/scalac \
+            -d /tmp/uth-post-id-classes \
+            under-the-hood/scalding/UthPostIds.scala \
+            /tmp/UthPostIdsVerification.scala
+          /tmp/scala-2.12.20/bin/scala \
+            -cp /tmp/uth-post-id-classes \
+            UthPostIdsVerification
+
+      - name: Verify report and pipeline contract
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          thrift = Path("under-the-hood/thrift/uth_serving.thrift").read_text()
+          daily = Path("under-the-hood/scalding/UthDailyPostsJob.scala").read_text()
+          backfill = Path("under-the-hood/scalding/UthDailyPostsBackfillJob.scala").read_text()
+          publisher = Path("under-the-hood/scalding/UthUserMonthMhPublisherJob.scala").read_text()
+          report = Path(
+              "under-the-hood/strato/columns/underTheHoodReport.User.strato"
+          ).read_text()
+          wrapper = Path(
+              "under-the-hood/strato/columns/underTheHoodReport.strato"
+          ).read_text()
+
+          assert "4: optional list<i64> postIds (personalDataType = 'TweetId')" in thrift
+          assert "11: optional list<i64> postIds (personalDataType = 'TweetId')" in thrift
+          assert "3: optional list<i64> postIds" not in thrift
+          assert "10: optional list<i64> postIds" not in thrift
+
+          assert daily.count("postIds = Some(postIds)") == 2
+          assert backfill.count("postIds = Some(postIds)") == 2
+          assert "summary.carried, summary.removed, summary.postIds" in daily
+          assert "summary.removed," in backfill
+          assert "summary.postIds" in backfill
+
+          assert "postIds = row.postIds.getOrElse(Seq.empty)" in publisher
+          assert "UthPostIds.newestDistinct(" in publisher
+          assert "UthPostIds.MaxPostIdsPerLabel" in publisher
+          assert "postIds = Some(postIds)" in publisher
+
+          assert "postIds = postIds.map(_.toString)" in report
+          assert "postIdsComplete = postIds.size.toLong == posts" in report
+          assert "CallContext.authenticatedTwitterUserId()" in wrapper
+          assert "accessPolicy = AllowTwitterUserId" in wrapper
+
+          def summarize(rows):
+              by_id = {}
+              for post_id, removed in rows:
+                  by_id[post_id] = by_id.get(post_id, False) or removed > 0
+              ids = sorted(by_id)
+              return len(ids), sum(by_id.values()), ids
+
+          carried, removed, ids = summarize(
+              [(300, 0), (100, 0), (300, 1), (200, 1)]
+          )
+          assert (carried, removed, ids) == (3, 2, [100, 200, 300])
+
+          full_month = sorted(set([10, 20] + [30, 40]))
+          assert len(full_month) == 4
+
+          partial_month = sorted(set([10, 20]))
+          existing_carried = 4
+          assert len(partial_month) != existing_carried
+          assert [str(v) for v in partial_month] == ["10", "20"]
+
+          for opening, closing in (("{", "}"), ("(", ")"), ("[", "]")):
+              assert report.count(opening) == report.count(closing), (
+                  opening,
+                  report.count(opening),
+                  closing,
+                  report.count(closing),
+              )
+
+          print("Under the Hood post-ID contract verification passed")
+          PY
+
+      - name: Verify focused final diff
+        run: |
+          git diff --check
+          actual="$(git diff --name-only | sort)"
+          expected="$(cat <<'EOF' | sort
+          under-the-hood/scalding/UthDailyPostsBackfillJob.scala
+          under-the-hood/scalding/UthDailyPostsJob.scala
+          under-the-hood/scalding/UthPostIds.scala
+          under-the-hood/scalding/UthUserMonthMhPublisherJob.scala
+          under-the-hood/strato/columns/underTheHoodReport.User.strato
+          under-the-hood/thrift/uth_serving.thrift
+          EOF
+          )"
+          test "$actual" = "$expected"
+
+      - name: Commit verified implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            under-the-hood/scalding/UthDailyPostsBackfillJob.scala \
+            under-the-hood/scalding/UthDailyPostsJob.scala \
+            under-the-hood/scalding/UthPostIds.scala \
+            under-the-hood/scalding/UthUserMonthMhPublisherJob.scala \
+            under-the-hood/strato/columns/underTheHoodReport.User.strato \
+            under-the-hood/thrift/uth_serving.thrift
+          git commit -m "under-the-hood: include labeled post ids in reports"
+          git push origin HEAD:ci/verify-uth-post-ids
