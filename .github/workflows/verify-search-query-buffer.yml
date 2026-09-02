@@ -5,8 +5,12 @@ on:
     branches:
       - ci/verify-search-query-buffer
 
+permissions:
+  contents: write
+
 jobs:
   verify:
+    if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -28,14 +32,45 @@ jobs:
             libibverbs-dev libnl-3-dev libnl-route-3-dev libclang-dev libnuma-dev \
             libssl-dev python3-dev protobuf-compiler
 
-      - name: Verify formatting and focused final diff
+      - name: Apply minimal production fix
         run: |
-          cargo fmt --manifest-path phoenix/Cargo.toml --all -- --check
-          git diff --check 7ba776848b12d8422eb0f291ee03ea5c17ab0188..HEAD
-          test "$(git diff --name-only 7ba776848b12d8422eb0f291ee03ea5c17ab0188..HEAD -- phoenix/crates/common/xai-recsys/src/util.rs)" = \
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("phoenix/crates/common/xai-recsys/src/util.rs")
+          text = path.read_text()
+
+          start_marker = (
+              "        let mut candidate_search_query_embeddings = "
+              "vec![0.0f32; search_query_embedding_dim];\n"
+          )
+          end_marker = "\n\n        let n_post_cat ="
+          start = text.index(start_marker)
+          end = text.index(end_marker, start)
+
+          replacement = '''        let candidate_search_query_embeddings = if search_query_embedding_dim > 0
+              && candidate_set.search_query_embedding.len() == search_query_embedding_dim
+          {
+              candidate_set.search_query_embedding.clone()
+          } else {
+              if search_query_embedding_dim > 0 && !candidate_set.search_query_embedding.is_empty() {
+                  log::error!(
+                      "search_query_embedding dim {} != model {search_query_embedding_dim}; using zero vector",
+                      candidate_set.search_query_embedding.len()
+                  );
+              }
+              vec![0.0f32; search_query_embedding_dim]
+          };'''
+
+          path.write_text(text[:start] + replacement + text[end:])
+          PY
+          cargo fmt --manifest-path phoenix/Cargo.toml --all
+          git diff --check
+          git restore phoenix/Cargo.lock || true
+          test "$(git diff --name-only)" = \
             "phoenix/crates/common/xai-recsys/src/util.rs"
 
-      - name: Prove the regression fails on upstream main
+      - name: Prove regression on upstream main
         run: |
           git worktree add /tmp/upstream-main 7ba776848b12d8422eb0f291ee03ea5c17ab0188
           python3 - <<'PY'
@@ -106,16 +141,27 @@ jobs:
           set -e
           cat /tmp/baseline-test.log
           test "$status" -ne 0
-          grep -q "missing_search_query_overwrites_reused_candidate_prefix_with_zeros" \
+          grep -q "left: \[1.0, 2.0, 1.0, 2.0, 9.0, 9.0\]" \
             /tmp/baseline-test.log
-          grep -q "FAILED" /tmp/baseline-test.log
+          grep -q "right: \[0.0, 0.0, 0.0, 0.0, 9.0, 9.0\]" \
+            /tmp/baseline-test.log
 
-      - name: Run focused and full common-crate tests
+      - name: Verify final implementation
         working-directory: phoenix
         run: |
+          cargo fmt --all -- --check
           cargo test -p xai-recsys search_query
           cargo test -p xai-recsys
+          cargo test -p xai-recsys-engine --lib
 
-      - name: Run serving-engine library tests
-        working-directory: phoenix
-        run: cargo test -p xai-recsys-engine --lib
+      - name: Commit verified implementation
+        run: |
+          git restore phoenix/Cargo.lock || true
+          git diff --check
+          test "$(git diff --name-only)" = \
+            "phoenix/crates/common/xai-recsys/src/util.rs"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add phoenix/crates/common/xai-recsys/src/util.rs
+          git commit -m "phoenix: prevent stale search query embeddings"
+          git push origin HEAD:ci/verify-search-query-buffer
