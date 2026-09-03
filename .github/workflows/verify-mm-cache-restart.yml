@@ -75,12 +75,23 @@ jobs:
                   (old_id, embedding(3.0)),
               ]);
 
-              let mut dst = vec![f16::ZERO; 4];
-              assert_eq!(cache.len(), 2, "recreated cache lost a live record");
-              assert!(cache.copy_to(new_id, &mut dst));
-              assert_eq!(dst, embedding(2.0));
-              assert!(cache.copy_to(old_id, &mut dst));
-              assert_eq!(dst, embedding(3.0));
+              let mut new_dst = vec![f16::ZERO; 4];
+              let mut old_dst = vec![f16::ZERO; 4];
+              let actual = (
+                  cache.len(),
+                  cache.copy_to(new_id, &mut new_dst),
+                  new_dst,
+                  cache.copy_to(old_id, &mut old_dst),
+                  old_dst,
+              );
+              let expected = (
+                  2,
+                  true,
+                  embedding(2.0),
+                  true,
+                  embedding(3.0),
+              );
+              assert_eq!(actual, expected, "recreated cache is internally inconsistent");
           }
           RS
 
