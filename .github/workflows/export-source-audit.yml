@@ -1,0 +1,33 @@
+name: Export source for audit
+
+on:
+  push:
+    branches:
+      - ci/export-x-source
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/export-x-source
+      - name: Package relevant source
+        run: |
+          tar -czf /tmp/x-spam-audit-source.tar.gz \
+            botmaker \
+            botmaker-rules \
+            scarecrow \
+            abuse-enforcement-service \
+            bdsm \
+            visibility-filtering \
+            visibility-filtering-client \
+            home-mixer \
+            README.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: x-spam-audit-source
+          path: /tmp/x-spam-audit-source.tar.gz
+          if-no-files-found: error
+          retention-days: 1
