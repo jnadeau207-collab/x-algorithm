@@ -1,0 +1,89 @@
+name: Verify MM cache restart safety
+
+on:
+  push:
+    branches:
+      - ci/verify-mm-cache-restart
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ci/verify-mm-cache-restart
+
+      - name: Add restart-safety regression test
+        run: |
+          mkdir -p phoenix/crates/serving/xai-recsys-mm-server/tests
+          cat > phoenix/crates/serving/xai-recsys-mm-server/tests/restart_safety.rs <<'RS'
+          use half::f16;
+          use std::time::{Duration, SystemTime, UNIX_EPOCH};
+          use tempfile::tempdir;
+          use xai_recsys_mm_server::embedding_cache::LmdbEmbeddingCache;
+
+          const TTL: Duration = Duration::from_secs(2 * 24 * 3600);
+
+          fn fresh_id(seq: u64) -> u64 {
+              const TWEPOCH_MS: u64 = 1_288_834_974_657;
+              let now_ms = SystemTime::now()
+                  .duration_since(UNIX_EPOCH)
+                  .unwrap()
+                  .as_millis() as u64;
+              ((now_ms - TWEPOCH_MS) << 22) | (seq & 0x3f_ffff)
+          }
+
+          fn embedding(value: f32) -> Vec<f16> {
+              vec![f16::from_f32(value); 4]
+          }
+
+          #[test]
+          fn recreating_cache_does_not_retain_stale_lmdb_index() {
+              let dir = tempdir().unwrap();
+              let lmdb_path = dir.path().join("idx.lmdb");
+              let data_path = dir.path().join("data.dat");
+              let old_id = fresh_id(1);
+              let new_id = fresh_id(2);
+
+              {
+                  let cache = LmdbEmbeddingCache::create(
+                      &lmdb_path,
+                      &data_path,
+                      3,
+                      4,
+                      TTL,
+                  )
+                  .unwrap();
+                  cache.insert_many(vec![(old_id, embedding(1.0))]);
+                  assert_eq!(cache.len(), 1);
+              }
+
+              let cache = LmdbEmbeddingCache::create(
+                  &lmdb_path,
+                  &data_path,
+                  3,
+                  4,
+                  TTL,
+              )
+              .unwrap();
+
+              // Insert a genuinely new key first, then a key retained by the stale
+              // LMDB index. A clean recreation must keep both records independently.
+              cache.insert_many(vec![
+                  (new_id, embedding(2.0)),
+                  (old_id, embedding(3.0)),
+              ]);
+
+              let mut dst = vec![f16::ZERO; 4];
+              assert_eq!(cache.len(), 2, "recreated cache lost a live record");
+              assert!(cache.copy_to(new_id, &mut dst));
+              assert_eq!(dst, embedding(2.0));
+              assert!(cache.copy_to(old_id, &mut dst));
+              assert_eq!(dst, embedding(3.0));
+          }
+          RS
+
+      - name: Run the deterministic reproducer
+        working-directory: phoenix
+        run: cargo test -p xai-recsys-mm-server --test restart_safety -- --nocapture
