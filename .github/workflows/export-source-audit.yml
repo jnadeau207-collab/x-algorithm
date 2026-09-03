@@ -8,26 +8,17 @@ on:
 jobs:
   export:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ci/export-x-source
-      - name: Package relevant source
+      - name: Package complete source
         run: |
-          tar -czf /tmp/x-spam-audit-source.tar.gz \
-            botmaker \
-            botmaker-rules \
-            scarecrow \
-            abuse-enforcement-service \
-            bdsm \
-            visibility-filtering \
-            visibility-filtering-client \
-            home-mixer \
-            README.md
+          tar --exclude=.git -czf /tmp/x-algorithm-source.tar.gz .
       - uses: actions/upload-artifact@v4
         with:
-          name: x-spam-audit-source
-          path: /tmp/x-spam-audit-source.tar.gz
+          name: x-algorithm-complete-source
+          path: /tmp/x-algorithm-source.tar.gz
           if-no-files-found: error
           retention-days: 1
