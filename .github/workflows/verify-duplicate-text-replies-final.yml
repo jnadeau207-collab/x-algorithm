@@ -1,0 +1,310 @@
+name: Verify final duplicate-reply failure isolation branch
+
+on:
+  push:
+    branches:
+      - ci/verify-duplicate-text-replies
+
+jobs:
+  verify:
+    if: "${{ github.event.head_commit.message == 'ci: verify final duplicate-reply branch' }}"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out clean contribution branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/duplicate-reply-cluster-failures
+          fetch-depth: 0
+
+      - name: Verify exact clean commit and policy preservation
+        run: |
+          set -euo pipefail
+          base=85ac72a1bba41f21615e3f0bca56da75970a6633
+          expected_head=6c471e37118ae3582aa85fc821bbac17e2ebf0dc
+          rule=botmaker-rules/scarecrow/bot/BBQDuplicateTextRepliesProd.bot
+
+          test "$(git rev-parse HEAD)" = "$expected_head"
+          test "$(git rev-parse HEAD^)" = "$base"
+          test "$(git rev-list --count "$base"..HEAD)" = '1'
+          test "$(git diff --name-only "$base"..HEAD)" = "$rule"
+          git diff --check "$base"..HEAD
+
+          git show "$base:$rule" > /tmp/base.bot
+          cp "$rule" /tmp/patched.bot
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          base = Path('/tmp/base.bot').read_text()
+          patched = Path('/tmp/patched.bot').read_text()
+
+          def condition(text: str) -> str:
+              return text.split('condition: |\n', 1)[1].split('action: |\n', 1)[0]
+
+          assert condition(base) == condition(patched), 'event eligibility changed'
+
+          original_literals = set(re.findall(r'"(?:[^"\\]|\\.)*"', base))
+          patched_literals = set(re.findall(r'"(?:[^"\\]|\\.)*"', patched))
+          assert patched_literals - original_literals == {
+              '"BBQDuplicateTextRepliesProd_eligibility_lookup_failed"',
+              '"BBQDuplicateTextRepliesProd_exemption_lookup_failed"',
+              '"BBQDuplicateTextRepliesProd_action_failed"',
+          }
+          assert not (original_literals - patched_literals)
+
+          function_pattern = re.compile(r'\b([A-Z][A-Za-z0-9_]*)\s*\(')
+          base_functions = set(function_pattern.findall(base))
+          patched_functions = set(function_pattern.findall(patched))
+          assert patched_functions - base_functions == {'IncrementStat'}
+          assert not (base_functions - patched_functions)
+
+          assert patched.count('TryOrElse(') == base.count('TryOrElse(') + 3
+          assert patched.count('IncrementStat(') == 3
+          assert ':tweetAuthor != -1 &&' in patched
+          assert patched.count('TweetRtfApplyLabel("COPYPASTA_SPAM", :tweetId);') == 1
+          assert patched.count(
+              'SetBigQuerytoBotmakerLabel(:prodJobName, ToString(:tweetId));'
+          ) == 1
+          assert patched.index('TweetRtfApplyLabel(') < patched.index(
+              'SetBigQuerytoBotmakerLabel('
+          )
+          assert '          };\n          TRUE\n        },' in patched
+          assert (
+              'Log("BBQDuplicateTextRepliesProd_rate_limited", :actionableTweets);\n'
+              '          FALSE'
+          ) in patched
+
+          print('Clean-commit and policy-preservation checks passed')
+          PY
+
+      - name: Parse baseline and patch with the repository grammar
+        run: |
+          set -euo pipefail
+          base=85ac72a1bba41f21615e3f0bca56da75970a6633
+          rule=botmaker-rules/scarecrow/bot/BBQDuplicateTextRepliesProd.bot
+          jar=/tmp/antlr-complete-3.5.2.jar
+
+          curl -fsSL --retry 5 \
+            https://repo.maven.apache.org/maven2/org/antlr/antlr-complete/3.5.2/antlr-complete-3.5.2.jar \
+            -o "$jar"
+          echo '7abf224f627594a3f4ae37fcfff296730f3f4edd  /tmp/antlr-complete-3.5.2.jar' \
+            | sha1sum --check --strict
+
+          mkdir -p /tmp/antlr-src /tmp/antlr-classes
+          cp botmaker/src/antlr/com/twitter/botmaker/antlr/BotMaker.g /tmp/antlr-src/
+          (
+            cd /tmp/antlr-src
+            java -jar "$jar" BotMaker.g
+          )
+
+          git show "$base:$rule" > /tmp/base.bot
+          cp "$rule" /tmp/patched.bot
+
+          python3 - <<'PY'
+          from pathlib import Path
+          from textwrap import dedent
+
+          def extract_action(source: Path, dest: Path) -> None:
+              lines = source.read_text().splitlines()
+              start = lines.index('action: |') + 1
+              body = []
+              for line in lines[start:]:
+                  if line and not line.startswith(' '):
+                      break
+                  body.append(line[2:] if line.startswith('  ') else line)
+              expression = dedent('\n'.join(body)).strip() + '\n'
+              if not expression.startswith('{') or not expression.rstrip().endswith('}'):
+                  raise SystemExit(f'{source}: action extraction failed')
+              dest.write_text(expression)
+
+          extract_action(Path('/tmp/base.bot'), Path('/tmp/base.action'))
+          extract_action(Path('/tmp/patched.bot'), Path('/tmp/patched.action'))
+          PY
+
+          cat > /tmp/ParseBotMaker.java <<'JAVA'
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import org.antlr.runtime.ANTLRStringStream;
+          import org.antlr.runtime.CommonTokenStream;
+          import com.twitter.botmaker.antlr.BotMakerLexer;
+          import com.twitter.botmaker.antlr.BotMakerParser;
+
+          public final class ParseBotMaker {
+            public static void main(String[] args) throws Exception {
+              for (String arg : args) {
+                String expression = Files.readString(Path.of(arg));
+                BotMakerLexer lexer = new BotMakerLexer(new ANTLRStringStream(expression));
+                BotMakerParser parser = new BotMakerParser(new CommonTokenStream(lexer));
+                parser.parse();
+                if (parser.getNumberOfSyntaxErrors() != 0) {
+                  throw new AssertionError(arg + " has syntax errors");
+                }
+                System.out.println("parsed " + arg);
+              }
+            }
+          }
+          JAVA
+
+          javac -cp "$jar" -d /tmp/antlr-classes \
+            /tmp/antlr-src/BotMakerLexer.java \
+            /tmp/antlr-src/BotMakerParser.java \
+            /tmp/ParseBotMaker.java
+          java -cp "$jar:/tmp/antlr-classes" ParseBotMaker \
+            /tmp/base.action /tmp/patched.action
+
+      - name: Prove fail-fast amplification and per-item isolation
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          filter_source = Path(
+              'botmaker/src/java/com/twitter/botmaker/function/collection/Filter.java'
+          ).read_text()
+          foreach_source = Path(
+              'botmaker/src/java/com/twitter/botmaker/function/collection/ForEach.java'
+          ).read_text()
+          try_source = Path(
+              'botmaker/src/java/com/twitter/botmaker/function/exception/TryOrElse.java'
+          ).read_text()
+          block_source = Path(
+              'botmaker/src/java/com/twitter/botmaker/function/Block.java'
+          ).read_text()
+          labels_source = Path('scarecrow/legacy/StratoRegistry.scala').read_text()
+          author_df = Path(
+              'botmaker-rules/scarecrow/derived-feature/GetTweetAuthorId.df'
+          ).read_text()
+          conjunction_source = Path(
+              'botmaker/src/java/com/twitter/botmaker/function/logic/Conjunction.java'
+          ).read_text()
+
+          assert 'Future.collect(conditions)' in filter_source
+          assert 'Future.collect(batchConditionsFuturesList)' in filter_source
+          assert 'currentFilteredObjectsFuture.flatMap' in filter_source
+          assert 'private static final int MAX_CONCURRENCY = 50;' in filter_source
+
+          assert 'Future.collect(listResultFutures)' in foreach_source
+          assert 'Future.collect(batchFuturesList)' in foreach_source
+          assert 'currentCollectedObjectsFuture.flatMap' in foreach_source
+          assert 'private static final int MAX_CONCURRENCY = 50;' in foreach_source
+
+          assert '.rescue(Function.func(t -> context.run(elseExtractor)))' in try_source
+          assert 'return valueFuture.flatMap(ignored -> runChildStatements' in block_source
+          assert '.getSafetyLabelMap(' in labels_source
+          assert 'GetTweet(:tweetId).core_data.user_id, -1' in author_df
+          assert 'if (!((Boolean) val))' in conjunction_source
+
+          class Failure(Exception):
+              pass
+
+          def batched_fail_fast_filter(items, predicate, batch_size=50):
+              filtered = []
+              evaluated = []
+              for start in range(0, len(items), batch_size):
+                  batch = items[start:start + batch_size]
+                  results = []
+                  failures = []
+                  for item in batch:
+                      evaluated.append(item)
+                      try:
+                          results.append((item, predicate(item)))
+                      except Failure as exc:
+                          failures.append(exc)
+                  if failures:
+                      raise failures[0]
+                  filtered.extend(item for item, keep in results if keep)
+              return filtered, evaluated
+
+          def isolated_filter(items, predicate, batch_size=50):
+              def rescued(item):
+                  try:
+                      return predicate(item)
+                  except Failure:
+                      return False
+              return batched_fail_fast_filter(items, rescued, batch_size)
+
+          ids = list(range(120))
+          read_failures = {7, 55}
+          evaluated = []
+
+          def eligibility(item):
+              if item in read_failures:
+                  raise Failure(item)
+              return item % 3 != 0
+
+          try:
+              _, evaluated = batched_fail_fast_filter(ids, eligibility)
+              raise AssertionError('baseline filter unexpectedly survived a failed lookup')
+          except Failure:
+              pass
+          assert evaluated == list(range(50)), evaluated
+
+          eligible, evaluated = isolated_filter(ids, eligibility)
+          assert evaluated == ids
+          assert 7 not in eligible and 55 not in eligible
+          assert 10 in eligible and 100 in eligible
+
+          def batched_fail_fast_foreach(items, action, batch_size=50):
+              started = []
+              for start in range(0, len(items), batch_size):
+                  batch = items[start:start + batch_size]
+                  failures = []
+                  for item in batch:
+                      started.append(item)
+                      try:
+                          action(item)
+                      except Failure as exc:
+                          failures.append(exc)
+                  if failures:
+                      raise failures[0]
+              return started
+
+          def isolated_foreach(items, action, batch_size=50):
+              succeeded = []
+              failed = []
+              for start in range(0, len(items), batch_size):
+                  for item in items[start:start + batch_size]:
+                      try:
+                          action(item)
+                          succeeded.append(item)
+                      except Failure:
+                          failed.append(item)
+              return succeeded, failed
+
+          labels = set()
+          markers = set()
+
+          def action(item):
+              if item in {11, 51}:
+                  raise Failure(item)
+              labels.add(item)
+              markers.add(item)
+              return True
+
+          try:
+              batched_fail_fast_foreach(ids, action)
+              raise AssertionError('baseline foreach unexpectedly survived a failed action')
+          except Failure:
+              pass
+          assert labels == markers == (set(range(50)) - {11})
+          assert 50 not in labels and 100 not in labels
+
+          labels.clear()
+          markers.clear()
+          succeeded, failed = isolated_foreach(ids, action)
+          assert failed == [11, 51]
+          assert 100 in succeeded
+          assert labels == markers == set(succeeded)
+          assert len(succeeded) == 118
+
+          print('Fail-fast amplification and per-item isolation checks passed')
+          PY
+
+      - name: Show final diff
+        run: |
+          git diff --stat 85ac72a1bba41f21615e3f0bca56da75970a6633..HEAD
+          git status --short
+          test -z "$(git status --porcelain)"
